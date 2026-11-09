@@ -1,0 +1,43 @@
+# Builds the 9front root image on every push and pull request, and
+# publishes it to ghcr.io/OWNER/mkroot-9front from main, tagged with the
+# release and latest.
+name: publish
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./... && go test ./...
+      - uses: actions/cache@v4
+        with:
+          path: .cache/*.iso.gz
+          key: iso-${{ hashFiles('pins') }}
+      - name: Build
+        if: github.event_name == 'pull_request'
+        run: go run ./cmd/mkroot
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish
+        if: github.event_name != 'pull_request'
+        run: |
+          . ./pins
+          image=ghcr.io/${GITHUB_REPOSITORY,,}
+          go run ./cmd/mkroot --push "$image:$RELEASE" --push "$image:latest"
