@@ -1,11 +1,14 @@
-// Command mkroot builds 9front root images from 9front's release ISOs and
-// pushes them as one multi-platform image:
+// Command mkroot builds 9front root images from 9front's release images
+// and pushes them as one multi-platform image:
 //
 //	go run ./cmd/mkroot --push ghcr.io/progrium/mkroot-9front:11952
 //
-// For each architecture it downloads the release ISO (and checks it
-// against pins), unpacks the ISO into a tar layer with Plan 9 owners and
+// For each architecture it downloads the release image (and checks it
+// against pins), unpacks its tree into a tar layer with Plan 9 owners and
 // modes, and makes an image of that one layer for platform plan9/ARCH.
+// 386 and amd64 come from the release ISOs. 9front ships no arm64 ISO,
+// so arm64 comes from the release's arm64 disk image: a qcow2 disk whose
+// Plan 9 partition holds an hjfs file system.
 package main
 
 import (
@@ -34,10 +37,16 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 
+	"github.com/progrium/mkroot-9front/disk"
+	"github.com/progrium/mkroot-9front/hjfs"
 	"github.com/progrium/mkroot-9front/iso9660"
+	"github.com/progrium/mkroot-9front/qcow2"
 )
 
-const isoURL = "https://9front.org/iso"
+const releaseURL = "https://9front.org/iso"
+
+// formats says which release image each architecture is built from.
+var formats = map[string]string{"386": "iso", "amd64": "iso", "arm64": "qcow2"}
 
 // mountPoints are the top-level directories 9front's kernel supplies
 // through #/ rather than the disk, so the ISO lacks them. h9 binds onto
@@ -49,6 +58,7 @@ var mountPoints = []string{
 
 // exclude are top-level directories left out: dist holds the installer's
 // payloads, a git repository of the release's source among them.
+// The arm64 disk has dist too.
 var exclude = []string{"dist"}
 
 type listFlag []string
@@ -58,9 +68,9 @@ func (l *listFlag) Set(s string) error { *l = append(*l, s); return nil }
 
 func main() {
 	var push listFlag
-	pinsFile := flag.String("pins", "pins", "file naming the release and its ISOs' hashes")
-	archs := flag.String("arch", "386,amd64", "architectures to build, comma-separated")
-	cache := flag.String("cache", ".cache", "directory for downloaded ISOs and built layers")
+	pinsFile := flag.String("pins", "pins", "file naming the release and its images' hashes")
+	archs := flag.String("arch", "386,amd64,arm64", "architectures to build, comma-separated")
+	cache := flag.String("cache", ".cache", "directory for downloaded images and built layers")
 	flag.Var(&push, "push", "reference to push the image to; repeatable")
 	flag.Parse()
 	log.SetFlags(0)
@@ -130,20 +140,39 @@ func readPins(path string) (map[string]string, error) {
 
 // build makes the image for one architecture.
 func build(cache, release, arch, sum string) (v1.Image, error) {
+	format, ok := formats[arch]
+	if !ok {
+		return nil, fmt.Errorf("9front ships no release image for %s", arch)
+	}
 	base := fmt.Sprintf("9front-%s.%s", release, arch)
-	gz := filepath.Join(cache, base+".iso.gz")
-	if err := fetch(isoURL+"/"+base+".iso.gz", gz); err != nil {
+	gz := filepath.Join(cache, base+"."+format+".gz")
+	if err := fetch(releaseURL+"/"+filepath.Base(gz), gz); err != nil {
 		return nil, err
 	}
 	if err := check(gz, sum); err != nil {
 		return nil, err
 	}
-	iso := filepath.Join(cache, base+".iso")
-	if err := gunzip(gz, iso); err != nil {
+	raw := filepath.Join(cache, base+"."+format)
+	if err := gunzip(gz, raw); err != nil {
 		return nil, err
 	}
 	layerPath := filepath.Join(cache, base+".tar")
-	newest, n, err := unpack(iso, layerPath)
+	f, err := os.Open(raw)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var walk walkFunc
+	switch format {
+	case "iso":
+		walk, err = isoTree(f)
+	case "qcow2":
+		walk, err = diskTree(f)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", raw, err)
+	}
+	newest, n, err := unpack(walk, layerPath)
 	if err != nil {
 		return nil, err
 	}
@@ -250,20 +279,59 @@ func gunzip(src, dst string) error {
 	return os.Rename(tmp, dst)
 }
 
-// unpack writes the ISO's tree as a tar. Owners are Plan 9 names with
-// zero ids, as h9reg expects of a Plan 9 layer. It returns the newest
-// modification time and the number of entries.
-func unpack(isoPath, tarPath string) (time.Time, int, error) {
+// entry is one file or directory of a release image's tree.
+type entry struct {
+	Path        string
+	Dir         bool
+	Mode        uint32
+	User, Group string
+	MTime       time.Time
+	Size        int64
+	open        func() io.Reader
+}
+
+// walkFunc calls fn for each entry of a tree, parents before children.
+type walkFunc func(fn func(entry) error) error
+
+// isoTree reads a release ISO.
+func isoTree(r io.ReaderAt) (walkFunc, error) {
+	im, err := iso9660.Open(r)
+	if err != nil {
+		return nil, err
+	}
+	return func(fn func(entry) error) error {
+		return im.Walk(func(f iso9660.File) error {
+			return fn(entry{f.Path, f.Dir, f.Mode, f.User, f.Group, f.MTime, f.Size, func() io.Reader { return im.Open(f) }})
+		})
+	}, nil
+}
+
+// diskTree reads the fs partition of a release disk image.
+func diskTree(r io.ReaderAt) (walkFunc, error) {
+	im, err := qcow2.Open(r)
+	if err != nil {
+		return nil, err
+	}
+	part, err := disk.Part(im, "fs")
+	if err != nil {
+		return nil, err
+	}
+	fs, err := hjfs.Open(part)
+	if err != nil {
+		return nil, err
+	}
+	return func(fn func(entry) error) error {
+		return fs.Walk(func(f hjfs.File) error {
+			return fn(entry{f.Path, f.Dir, f.Mode, f.User, f.Group, f.MTime, f.Size, func() io.Reader { return fs.Open(f) }})
+		})
+	}, nil
+}
+
+// unpack writes a tree as a tar. Owners are Plan 9 names with zero ids,
+// as h9reg expects of a Plan 9 layer. It returns the newest modification
+// time and the number of entries.
+func unpack(walk walkFunc, tarPath string) (time.Time, int, error) {
 	var newest time.Time
-	f, err := os.Open(isoPath)
-	if err != nil {
-		return newest, 0, err
-	}
-	defer f.Close()
-	im, err := iso9660.Open(f)
-	if err != nil {
-		return newest, 0, fmt.Errorf("%s: %w", isoPath, err)
-	}
 	out, err := os.Create(tarPath)
 	if err != nil {
 		return newest, 0, err
@@ -273,7 +341,7 @@ func unpack(isoPath, tarPath string) (time.Time, int, error) {
 	tw := tar.NewWriter(bw)
 	n := 0
 	seen := map[string]bool{}
-	err = im.Walk(func(file iso9660.File) error {
+	err = walk(func(file entry) error {
 		top, _, _ := strings.Cut(file.Path, "/")
 		if slices.Contains(exclude, top) {
 			return nil
@@ -301,7 +369,7 @@ func unpack(isoPath, tarPath string) (time.Time, int, error) {
 			return err
 		}
 		if !file.Dir {
-			if _, err := io.Copy(tw, im.Open(file)); err != nil {
+			if _, err := io.Copy(tw, file.open()); err != nil {
 				return fmt.Errorf("%s: %w", file.Path, err)
 			}
 		}
@@ -328,7 +396,7 @@ func unpack(isoPath, tarPath string) (time.Time, int, error) {
 		return newest, 0, err
 	}
 	if n == 0 {
-		return newest, 0, errors.New("empty ISO")
+		return newest, 0, errors.New("empty tree")
 	}
 	return newest, n, out.Close()
 }

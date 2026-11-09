@@ -1,5 +1,6 @@
 # The 9front release this repository builds, and the sha256 of each
-# release ISO as 9front.org serves it (gzipped). Bump deliberately.
+# release image as 9front.org serves it (gzipped). Bump deliberately.
 RELEASE=11952
 SHA256_386=b338c4cdf65d9fb8950b22dd21873d27d15254862cb9de8f7cd0c112b2663b05
 SHA256_amd64=59ba79f1304f02c1aae573b337fa2569fc78027ce8e4c2056c4117e971025b91
+SHA256_arm64=1199debe5e9cadadb9d143c9f64ef02c8a8010e173ebbff69aeaa23dff1a7457
