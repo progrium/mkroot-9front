@@ -24,8 +24,8 @@ jobs:
       - run: go vet ./... && go test ./...
       - uses: actions/cache@v4
         with:
-          path: .cache/*.iso.gz
-          key: iso-${{ hashFiles('pins') }}
+          path: .cache/*.gz
+          key: release-${{ hashFiles('pins') }}
       - name: Build
         if: github.event_name == 'pull_request'
         run: go run ./cmd/mkroot
