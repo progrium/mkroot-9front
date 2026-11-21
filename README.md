@@ -5,7 +5,7 @@ Builds [9front](https://9front.org) root trees as container images, for
 [h9reg](https://github.com/progrium/h9reg):
 
 ```sh
-h9 --root ws://reg.example/progrium/9front rc
+h9 --url ws://reg.example/progrium/9front rc
 ```
 
 h9reg looks a name such as `progrium/9front` up as
